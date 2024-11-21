@@ -1,0 +1,5 @@
+<config>
+    <visualizer_path>/usr/bin/display</visualizer_path>
+    <repository_path>https://github.com/Aleksikkk/Config_hw2</repository_path>
+    <target_file>config2.ini</target_file>
+</config>
