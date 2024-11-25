@@ -1,78 +1,148 @@
-import argparse
-import subprocess
 import os
+import hashlib
 import xml.etree.ElementTree as ET
-from graphviz import Digraph
+from pathlib import Path
+from subprocess import run
 
 
-def parse_config(config_path):
-    """Парсит XML конфигурационный файл."""
+class GitRepository:
+    """Класс для работы с существующим репозиторием Git."""
+
+    def __init__(self, repo_path, target_file):
+        self.repo_path = Path(repo_path).resolve()
+        self.target_file = target_file
+        self.objects_path = self.repo_path / ".git" / "objects"
+        self.head_path = self.repo_path / ".git" / "HEAD"
+        self.commits = {}
+
+        if not (self.repo_path / ".git").exists():
+            raise ValueError(f"{repo_path} не является репозиторием Git.")
+
+    def read_head(self):
+        """Читает текущую ветку из HEAD."""
+        with open(self.head_path, "r") as f:
+            content = f.read().strip()
+        if content.startswith("ref:"):
+            ref_path = content.split(" ", 1)[1]
+            return (self.repo_path / ".git" / ref_path).read_text().strip()
+        return content
+
+    def get_commit(self, commit_hash):
+        """Возвращает содержимое коммита по его хэшу."""
+        obj_path = self.objects_path / commit_hash[:2] / commit_hash[2:]
+        if not obj_path.exists():
+            raise FileNotFoundError(f"Объект {commit_hash} не найден.")
+        with open(obj_path, "rb") as f:
+            raw_data = f.read()
+
+        # Декодируем zlib-упакованные данные
+        import zlib
+        data = zlib.decompress(raw_data).decode()
+        obj_type, _, content = data.partition("\0")
+        if obj_type != "commit":
+            raise ValueError(f"Объект {commit_hash} не является коммитом.")
+        return content
+
+    def parse_commit(self, commit_hash):
+        """Парсит содержимое коммита и возвращает его детали."""
+        content = self.get_commit(commit_hash)
+        lines = content.splitlines()
+        tree_hash = None
+        parents = []
+        author = None
+        for line in lines:
+            if line.startswith("tree "):
+                tree_hash = line.split(" ", 1)[1]
+            elif line.startswith("parent "):
+                parents.append(line.split(" ", 1)[1])
+            elif line.startswith("author "):
+                author = line.split(" ", 1)[1]
+        return {
+            "hash": commit_hash,
+            "tree": tree_hash,
+            "parents": parents,
+            "author": author,
+        }
+
+    def collect_commits(self):
+        """Собирает коммиты начиная с HEAD."""
+        head_commit = self.read_head()
+        queue = [head_commit]
+        visited = set()
+
+        while queue:
+            commit_hash = queue.pop()
+            if commit_hash in visited:
+                continue
+            visited.add(commit_hash)
+
+            try:
+                commit_data = self.parse_commit(commit_hash)
+                self.commits[commit_hash] = commit_data
+                queue.extend(commit_data["parents"])
+            except Exception as e:
+                print(f"Ошибка обработки коммита {commit_hash}: {e}")
+
+    def filter_commits_by_file(self):
+        """Фильтрует коммиты, в которых фигурирует указанный файл."""
+        filtered_commits = {}
+        for commit_hash, commit_data in self.commits.items():
+            tree_hash = commit_data["tree"]
+            if self.file_in_tree(tree_hash, self.target_file):
+                filtered_commits[commit_hash] = commit_data
+        self.commits = filtered_commits
+
+    def file_in_tree(self, tree_hash, target_file):
+        """Проверяет, содержится ли файл в указанном дереве."""
+        tree_path = self.objects_path / tree_hash[:2] / tree_hash[2:]
+        if not tree_path.exists():
+            return False
+
+        with open(tree_path, "rb") as f:
+            import zlib
+            data = zlib.decompress(f.read()).decode()
+        return target_file in data
+
+    def generate_mermaid(self):
+        """Генерирует граф зависимостей в формате Mermaid."""
+        lines = ["graph TD"]
+        for commit_hash, commit_data in self.commits.items():
+            for parent in commit_data["parents"]:
+                lines.append(f"    {commit_hash} --> {parent}")
+            lines.append(f'    {commit_hash}["{commit_hash}\\n{commit_data["author"]}"]')
+        return "\n".join(lines)
+
+
+def read_config(config_path):
+    """Читает конфигурацию из XML."""
     tree = ET.parse(config_path)
     root = tree.getroot()
-    config = {
-        'visualizer_path': root.find('visualizer_path').text,
-        'repository_path': root.find('repository_path').text,
-        'target_file': root.find('target_file').text,
-    }
-    return config
+
+    visualizer_path = root.find("visualizerPath").text.strip()
+    repo_path = root.find("repositoryPath").text.strip()
+    target_file = root.find("targetFile").text.strip()
+
+    return visualizer_path, repo_path, target_file
 
 
-def get_git_commits(repo_path, target_file):
-    """Получает список коммитов, затрагивающих заданный файл."""
-    os.chdir(repo_path)
-    result = subprocess.run(
-        ['git', 'log', '--pretty=format:%H|%an|%ad', '--date=iso', '--', target_file],
-        stdout=subprocess.PIPE,
-        text=True,
-        check=True
-    )
-    commits = []
-    for line in result.stdout.splitlines():
-        commit_hash, author, date = line.split('|', 2)
-        commits.append({'hash': commit_hash, 'author': author, 'date': date})
-    return commits
+if __name__ == "__main__":
+    # Читаем конфигурацию
+    config_path = "config.xml"
+    visualizer_path, repo_path, target_file = read_config(config_path)
 
+    # Работаем с репозиторием
+    repo = GitRepository(repo_path, target_file)
+    repo.collect_commits()
+    repo.filter_commits_by_file()
+    mermaid_graph = repo.generate_mermaid()
 
-def build_graph(commits):
-    """Строит граф в формате Mermaid."""
-    dot = Digraph(comment='Dependency Graph')
-    for commit in commits:
-        node_id = commit['hash'][:7]  # Сокращенный hash для узла
-        label = f"{commit['date']}\n{commit['author']}"
-        dot.node(node_id, label)
+    # Выводим граф
+    print("Mermaid Graph:")
+    print(mermaid_graph)
 
-    for i in range(len(commits) - 1):
-        dot.edge(commits[i + 1]['hash'][:7], commits[i]['hash'][:7])
-
-    return dot
-
-
-def visualize_graph(graph, output_path, visualizer_path):
-    """Сохраняет и визуализирует граф."""
-    graph.render(output_path, format='png', cleanup=True)
-    subprocess.run([visualizer_path, f"{output_path}.png"], check=True)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Генератор графа зависимостей Git.")
-    parser.add_argument('config', type=str, help="config.xml")
-    args = parser.parse_args()
-
-    # Чтение конфигурации
-    config = parse_config(args.config)
-    repo_path = config['repository_path']
-    target_file = config['target_file']
-    visualizer_path = config['visualizer_path']
-
-    # Получение данных о коммитах
-    commits = get_git_commits(repo_path, target_file)
-
-    # Построение графа
-    graph = build_graph(commits)
-
-    # Визуализация графа
-    visualize_graph(graph, 'dependency_graph', visualizer_path)
-
-
-if __name__ == '__main__':
-    main()
+    # Вызываем визуализатор
+    if visualizer_path:
+        mermaid_file = "graph.mmd"
+        with open(mermaid_file, "w") as f:
+            f.write(mermaid_graph)
+        run([visualizer_path, mermaid_file])
