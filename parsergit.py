@@ -3,6 +3,7 @@ import hashlib
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from subprocess import run
+from datetime import datetime
 
 
 class GitRepository:
@@ -20,11 +21,11 @@ class GitRepository:
 
     def read_head(self):
         """Читает текущую ветку из HEAD."""
-        with open(self.head_path, "r") as f:
+        with open(self.head_path, "r", encoding="utf-8") as f:
             content = f.read().strip()
         if content.startswith("ref:"):
             ref_path = content.split(" ", 1)[1]
-            return (self.repo_path / ".git" / ref_path).read_text().strip()
+            return (self.repo_path / ".git" / ref_path).read_text(encoding="utf-8").strip()
         return content
 
     def get_commit(self, commit_hash):
@@ -37,31 +38,37 @@ class GitRepository:
 
         # Декодируем zlib-упакованные данные
         import zlib
-        data = zlib.decompress(raw_data).decode()
+        data = zlib.decompress(raw_data).decode('utf-8')
         obj_type, _, content = data.partition("\0")
         if obj_type != "commit":
             raise ValueError(f"Объект {commit_hash} не является коммитом.")
         return content
 
     def parse_commit(self, commit_hash):
-        """Парсит содержимое коммита и возвращает его детали."""
+        """Парсит содержимое коммита и возвращает его детали, включая дату и время."""
         content = self.get_commit(commit_hash)
         lines = content.splitlines()
         tree_hash = None
         parents = []
         author = None
+        author_date = None  # Добавим переменную для хранения даты и времени
+
         for line in lines:
             if line.startswith("tree "):
                 tree_hash = line.split(" ", 1)[1]
             elif line.startswith("parent "):
                 parents.append(line.split(" ", 1)[1])
             elif line.startswith("author "):
-                author = line.split(" ", 1)[1]
+                author_info = line.split(" ", 1)[1]
+                author_name, author_email, author_timestamp, author_timezone = author_info.split(" ")
+                author_date = datetime.utcfromtimestamp(int(author_timestamp)).strftime('%Y-%m-%d %H:%M:%S')  # Преобразуем timestamp в дату
+
         return {
             "hash": commit_hash,
             "tree": tree_hash,
             "parents": parents,
             "author": author,
+            "date": author_date,  # Добавляем дату и время в данные коммита
         }
 
     def collect_commits(self):
@@ -100,16 +107,17 @@ class GitRepository:
 
         with open(tree_path, "rb") as f:
             import zlib
-            data = zlib.decompress(f.read()).decode()
+            data = zlib.decompress(f.read()).decode('utf-8')
         return target_file in data
 
     def generate_mermaid(self):
-        """Генерирует граф зависимостей в формате Mermaid."""
+        """Генерирует граф зависимостей в формате Mermaid с датой и временем."""
         lines = ["graph TD"]
         for commit_hash, commit_data in self.commits.items():
             for parent in commit_data["parents"]:
                 lines.append(f"    {commit_hash} --> {parent}")
-            lines.append(f'    {commit_hash}["{commit_hash}\\n{commit_data["author"]}"]')
+            # Вставляем дату и время в блок коммита
+            lines.append(f'    {commit_hash}["{commit_hash}\n{commit_data["author"]}\n{commit_data["date"]}"]')
         return "\n".join(lines)
 
 
@@ -143,6 +151,7 @@ if __name__ == "__main__":
     # Вызываем визуализатор
     if visualizer_path:
         mermaid_file = "graph.mmd"
-        with open(mermaid_file, "w") as f:
+        with open(mermaid_file, "w", encoding="utf-8") as f:
             f.write(mermaid_graph)
-        run([visualizer_path, mermaid_file])
+        # На Windows важно убедиться, что путь правильный
+        run([visualizer_path, mermaid_file], shell=True)
